@@ -1,0 +1,3 @@
+#!/data/data/com.termux/files/usr/bin/bash
+cd ~/llama
+exec proot -0 ./llama.exe "$@"
