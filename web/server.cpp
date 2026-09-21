@@ -8,13 +8,20 @@
 #include <fstream>
 #include <sstream>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#include <limits.h>
+#endif
+
 #include "httplib.h"
 #include "llama.h"
 
 namespace fs = std::filesystem;
 
 std::mutex g_llm_mutex;
-std::string g_system_prompt = "You are AetherOS, an elite offline neural assistant. Provide sharp, structured, and helpful responses.";
+std::string g_system_prompt = "You are AetherOS, an elite offline neural assistant by @dev-aemni. Provide direct, structured, and helpful answers.";
 std::string g_current_model_path = "";
 float g_temperature = 0.7f;
 std::atomic<bool> g_stop_generation{false};
@@ -22,6 +29,29 @@ std::atomic<bool> g_stop_generation{false};
 llama_model* g_model = nullptr;
 llama_context* g_ctx = nullptr;
 const struct llama_vocab* g_vocab = nullptr;
+
+fs::path get_app_dir() {
+#ifdef _WIN32
+    char buffer[MAX_PATH];
+    GetModuleFileNameA(NULL, buffer, MAX_PATH);
+    return fs::path(buffer).parent_path();
+#elif defined(__linux__) || defined(__ANDROID__)
+    char buffer[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (len != -1) {
+        buffer[len] = '\0';
+        return fs::canonical(fs::path(buffer)).parent_path();
+    }
+    const char* home = getenv("HOME");
+    if (home) {
+        fs::path p = fs::path(home) / "llama";
+        if (fs::exists(p)) return p;
+    }
+    return fs::current_path();
+#else
+    return fs::current_path();
+#endif
+}
 
 bool load_model(const std::string& path) {
     std::lock_guard<std::mutex> lock(g_llm_mutex);
@@ -45,8 +75,9 @@ bool load_model(const std::string& path) {
 
 std::vector<std::string> get_models() {
     std::vector<std::string> list;
-    if (fs::exists("model")) {
-        for (const auto& e : fs::directory_iterator("model")) {
+    fs::path mdir = get_app_dir() / "model";
+    if (fs::exists(mdir)) {
+        for (const auto& e : fs::directory_iterator(mdir)) {
             if (e.is_regular_file() && e.path().extension() == ".gguf") {
                 list.push_back(e.path().string());
             }
@@ -55,25 +86,26 @@ std::vector<std::string> get_models() {
     return list;
 }
 
-// Embedded Web UI with LocalStorage, Markdown, Code Copy, and .aos / .aosb support
+// AetherOS Web Interface (Single-Solid Amber Accent + Shimmer Thinking State)
 const char* HTML_UI = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>AetherOS // Neural Interface</title>
+<title>AetherOS // Neural Console</title>
 <style>
   :root {
-    --bg: #0b0e14;
-    --panel: #151921;
-    --border: #232a36;
-    --accent: #00ff88;
-    --user-msg: #0284c7;
-    --text: #e2e8f0;
-    --code-bg: #07090d;
+    --bg: #09090b;
+    --surface: #121215;
+    --border: #24242a;
+    --amber: #D97706; /* Signature AetherOS Amber */
+    --amber-hover: #b45309;
+    --text: #f4f4f5;
+    --muted: #71717a;
+    --code-bg: #070709;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif; }
 
   html, body {
     height: 100%;
@@ -83,7 +115,7 @@ const char* HTML_UI = R"rawliteral(
     overflow: hidden;
   }
 
-  #app-root {
+  #layout {
     display: flex;
     flex-direction: column;
     height: 100%;
@@ -93,257 +125,235 @@ const char* HTML_UI = R"rawliteral(
     top: 0; left: 0;
   }
 
+  /* Minimal Top Bar */
   header {
-    flex: 0 0 54px;
-    background: var(--panel);
+    flex: 0 0 46px;
+    background: var(--surface);
     border-bottom: 1px solid var(--border);
     padding: 0 16px;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    z-index: 10;
+    z-index: 20;
   }
-  .hdr-left { display: flex; align-items: center; gap: 12px; }
-  .menu-btn { background: transparent; border: none; color: var(--accent); font-size: 1.4rem; cursor: pointer; }
-  header h1 { font-size: 1.05rem; color: var(--accent); letter-spacing: 1px; }
-  #status { font-size: 0.8rem; color: #94a3b8; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .menu-btn { background: transparent; border: none; color: var(--amber); font-size: 1.25rem; cursor: pointer; }
+  .brand h1 { font-size: 0.95rem; font-weight: 700; color: var(--text); letter-spacing: 0.5px; }
+  .brand span { color: var(--amber); }
+  #status-pill { font-size: 0.75rem; color: var(--muted); }
 
-  #chat {
+  /* Feed Area (Responds on top) */
+  #chat-feed {
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
-    padding: 16px;
+    padding: 16px 16px 90px 16px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 16px;
     -webkit-overflow-scrolling: touch;
   }
 
-  .msg { max-width: 90%; padding: 12px 16px; border-radius: 8px; line-height: 1.5; font-size: 0.95rem; word-wrap: break-word; }
-  .user { align-self: flex-end; background: var(--user-msg); color: #fff; }
-  .bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); color: var(--text); }
-  .bot b { color: var(--accent); }
+  .entry { display: flex; flex-direction: column; gap: 4px; }
+  .tag { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.5px; }
+  .tag.user { color: var(--muted); align-self: flex-end; }
+  .tag.bot { color: var(--amber); }
 
-  /* Code Blocks with Copy Button */
-  pre {
+  .bubble {
+    max-width: 90%;
+    padding: 12px 14px;
+    border-radius: 6px;
+    font-size: 0.925rem;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+  .bubble.user {
+    align-self: flex-end;
+    background: #18181c;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .bubble.bot {
+    align-self: flex-start;
+    background: transparent;
+    padding-left: 0;
+  }
+
+  /* Animated Thinking State */
+  .thinking-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #171410;
+    border: 1px solid #3d2b19;
+    color: var(--amber);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-family: monospace;
+    animation: pulse 1.5s infinite ease-in-out;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 0.7; } 50% { opacity: 1; } }
+
+  /* Code Blocks with Language & Copy */
+  .code-block {
     background: var(--code-bg);
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 10px;
     margin: 8px 0;
-    position: relative;
-    overflow-x: auto;
+    overflow: hidden;
   }
-  code { font-family: "Fira Code", monospace; font-size: 0.85rem; color: #38bdf8; }
-  .copy-btn {
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    background: #1e293b;
-    color: #94a3b8;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 3px 8px;
-    font-size: 0.75rem;
-    cursor: pointer;
-  }
-
-  footer {
-    flex: 0 0 auto;
-    background: var(--panel);
-    border-top: 1px solid var(--border);
-    padding: 10px 12px;
-    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  .code-top {
+    background: #111115;
+    border-bottom: 1px solid var(--border);
+    padding: 4px 10px;
     display: flex;
-    gap: 8px;
-    align-items: center;
-    z-index: 10;
+    justify-content: space-between;
+    font-size: 0.7rem;
+    color: var(--muted);
   }
+  pre { padding: 10px; overflow-x: auto; margin: 0; font-family: monospace; font-size: 0.85rem; color: #fbbf24; }
+  .copy-btn { background: #18181c; border: 1px solid var(--border); color: #ccc; border-radius: 4px; padding: 2px 6px; cursor: pointer; font-size: 0.65rem; }
 
+  /* Anchored Bottom Input Dock */
+  .dock {
+    position: fixed;
+    bottom: 0; left: 0;
+    width: 100%;
+    padding: 10px 14px max(12px, env(safe-area-inset-bottom)) 14px;
+    background: linear-gradient(to top, var(--bg) 85%, transparent);
+    z-index: 30;
+  }
+  .dock-box {
+    max-width: 780px;
+    margin: 0 auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dock-box:focus-within { border-color: var(--amber); }
   input {
     flex: 1;
-    background: var(--bg);
-    border: 1px solid var(--border);
+    background: transparent;
+    border: none;
     color: #fff;
-    padding: 12px;
-    border-radius: 6px;
     font-size: 16px;
     outline: none;
   }
-  input:focus { border-color: var(--accent); }
-
-  button.btn {
-    padding: 0 16px;
-    height: 44px;
-    border: none;
+  .action-btn {
+    width: 34px; height: 34px;
     border-radius: 6px;
-    font-weight: bold;
+    border: none;
     cursor: pointer;
+    font-weight: bold;
+    display: flex; align-items: center; justify-content: center;
   }
-  #send { background: #059669; color: #fff; }
-  #stop { background: #dc2626; color: #fff; }
+  .send { background: var(--amber); color: #000; }
+  .stop { background: #dc2626; color: #fff; }
 
-  /* Hamburger Drawer */
+  /* Drawer Menu */
   #drawer {
     position: fixed;
     top: 0; left: -100%;
-    width: 85%;
-    max-width: 340px;
+    width: 80%; max-width: 320px;
     height: 100%;
-    background: #10141a;
+    background: var(--surface);
     border-right: 1px solid var(--border);
     z-index: 100;
-    transition: left 0.25s ease;
+    transition: left 0.2s ease;
     padding: 20px;
     display: flex;
     flex-direction: column;
     gap: 14px;
-    overflow-y: auto;
   }
   #drawer.open { left: 0; }
   #overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; z-index: 90; }
   #overlay.open { display: block; }
-  .drawer-title { color: var(--accent); font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 8px; font-weight: bold; }
-  .drawer-label { font-size: 0.85rem; color: #94a3b8; margin-bottom: 4px; }
-  textarea {
-    width: 100%;
-    height: 90px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: #fff;
-    padding: 8px;
-    border-radius: 6px;
-    font-size: 14px;
-    resize: none;
+  select, textarea {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); color: #fff;
+    padding: 8px; border-radius: 6px; font-size: 0.85rem; outline: none;
   }
-  select {
-    width: 100%;
-    padding: 10px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: #fff;
-    border-radius: 6px;
-  }
-  .btn-group { display: flex; gap: 8px; }
-  .btn-group button { flex: 1; height: 38px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 0.8rem; }
+  .p-btn { height: 34px; background: #18181c; border: 1px solid var(--border); color: #fff; border-radius: 6px; cursor: pointer; }
 </style>
 </head>
 <body>
 
-<div id="app-root">
+<div id="layout">
   <header>
-    <div class="hdr-left">
+    <div class="brand">
       <button class="menu-btn" onclick="toggleDrawer()">☰</button>
-      <h1>AETHER-OS</h1>
+      <h1>AETHER-OS <span>//</span> CORE</h1>
     </div>
-    <span id="status">Ready</span>
+    <span id="status-pill">Ready</span>
   </header>
 
-  <div id="chat"></div>
+  <div id="chat-feed"></div>
 
-  <footer>
-    <input type="text" id="prompt" placeholder="Ask AetherOS..." autocomplete="off" />
-    <button class="btn" id="send" onclick="sendPrompt()">SEND</button>
-    <button class="btn" id="stop" onclick="stopGen()">STOP</button>
-  </footer>
+  <div class="dock">
+    <div class="dock-box">
+      <input type="text" id="prompt-in" placeholder="Message AetherOS..." autocomplete="off" />
+      <button class="action-btn send" id="send-btn" onclick="sendPrompt()">▲</button>
+      <button class="action-btn stop" id="stop-btn" style="display:none;" onclick="stopGen()">■</button>
+    </div>
+  </div>
 </div>
 
-<!-- Drawer Menu -->
+<!-- Settings Drawer -->
 <div id="overlay" onclick="toggleDrawer()"></div>
 <div id="drawer">
-  <div class="drawer-title">AETHER-OS CONTROL</div>
-
+  <div style="font-size:0.85rem; font-weight:700; color:var(--amber);">AETHER-OS DIRECTIVES</div>
   <div>
-    <div class="drawer-label">Active Model</div>
+    <div style="font-size:0.75rem; color:var(--muted); margin-bottom:4px;">Active Model</div>
     <select id="model_select" onchange="changeModel(this.value)"></select>
   </div>
-
   <div>
-    <div class="drawer-label">System Prompt (.aosb)</div>
-    <textarea id="sys_prompt"></textarea>
+    <div style="font-size:0.75rem; color:var(--muted); margin-bottom:4px;">System Directives (.aosb)</div>
+    <textarea id="sys_prompt" rows="3"></textarea>
   </div>
-
-  <div class="btn-group">
-    <button style="background: #0284c7; color: #fff;" onclick="saveConfig()">SAVE CONFIG</button>
-    <button style="background: #334155; color: #fff;" onclick="exportBotConfig()">EXPORT .AOSB</button>
-  </div>
-  <div class="btn-group">
-    <button style="background: #1e293b; color: #38bdf8;" onclick="triggerImport('aosb')">IMPORT .AOSB</button>
-  </div>
-
-  <hr style="border-color: var(--border);" />
-
-  <div class="drawer-label">Session Management (.aos)</div>
-  <div class="btn-group">
-    <button style="background: #059669; color: #fff;" onclick="exportChatSession()">EXPORT .AOS</button>
-    <button style="background: #1e293b; color: #34d399;" onclick="triggerImport('aos')">IMPORT .AOS</button>
-  </div>
-
-  <button class="btn" style="background: #991b1b; color: #fff; height: 38px;" onclick="clearChat()">CLEAR CHAT</button>
+  <button class="p-btn" onclick="saveConfig()">Save Directives</button>
+  <button class="p-btn" style="background:#2a1515; color:#ef4444; margin-top:auto;" onclick="clearChat()">Reset Memory</button>
 </div>
-
-<!-- Hidden File Pickers for .aos and .aosb -->
-<input type="file" id="file_import_aos" accept=".aos" style="display:none" onchange="importChatFile(event)" />
-<input type="file" id="file_import_aosb" accept=".aosb" style="display:none" onchange="importBotFile(event)" />
 
 <script>
   let chatHistory = [];
-  const STORAGE_KEY = 'AETHEROS_CHAT_V1';
-  const CONFIG_KEY = 'AETHEROS_CONFIG_V1';
+  const STORAGE_KEY = 'AETHEROS_WEB_CHAT';
+  const CONFIG_KEY = 'AETHEROS_WEB_SYS';
+  let thinkingTimer = null;
 
-  // Format basic Markdown into HTML
-  function renderMarkdown(txt) {
-    let html = txt
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      .replace(/```([\s\S]*?)```/g, (match, p1) => {
-        return `<pre><button class="copy-btn" onclick="copyCode(this)">Copy</button><code>${p1.trim()}</code></pre>`;
+  function parseMarkdown(t) {
+    return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/```([a-zA-Z]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+        const l = lang ? lang.toUpperCase() : "CODE";
+        return `<div class="code-block"><div class="code-top"><span>${l}</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div><pre><code>${code.trim()}</code></pre></div>`;
       })
       .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
       .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/^# (.*$)/gim, '<h3 style="color:var(--accent);margin:4px 0;">$1</h3>')
       .replace(/\n/g, '<br/>');
-    return html;
   }
 
   function copyCode(btn) {
-    const code = btn.nextElementSibling.innerText;
+    const code = btn.closest('.code-block').querySelector('code').innerText;
     navigator.clipboard.writeText(code);
     btn.innerText = 'Copied!';
     setTimeout(() => btn.innerText = 'Copy', 1500);
   }
 
-  function renderChat() {
-    const container = document.getElementById('chat');
-    container.innerHTML = '';
-    if (chatHistory.length === 0) {
-      container.innerHTML = '<div class="msg bot"><b>[AOS]</b> AetherOS Ready. Memory active.</div>';
-      return;
-    }
+  function renderFeed() {
+    const feed = document.getElementById('chat-feed');
+    feed.innerHTML = '';
     chatHistory.forEach(m => {
-      const d = document.createElement('div');
-      d.className = `msg ${m.role === 'User' ? 'user' : 'bot'}`;
-      d.innerHTML = m.role === 'User' ? m.text : `<b>[AOS]</b> ` + renderMarkdown(m.text);
-      container.appendChild(d);
+      const isUser = m.role === 'User';
+      feed.innerHTML += `
+        <div class="entry">
+          <span class="tag ${isUser ? 'user' : 'bot'}">${isUser ? 'YOU' : 'AETHER-OS'}</span>
+          <div class="bubble ${isUser ? 'user' : 'bot'}">${isUser ? m.text : parseMarkdown(m.text)}</div>
+        </div>`;
     });
-    container.scrollTop = container.scrollHeight;
-  }
-
-  function saveStorage() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(chatHistory));
-  }
-
-  function loadStorage() {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      try { chatHistory = JSON.parse(raw); } catch(e) { chatHistory = []; }
-    }
-    renderChat();
-
-    const savedSys = localStorage.getItem(CONFIG_KEY);
-    if (savedSys) {
-      document.getElementById('sys_prompt').value = savedSys;
-      saveConfig(false);
-    }
+    feed.scrollTop = feed.scrollHeight;
   }
 
   function toggleDrawer() {
@@ -351,100 +361,27 @@ const char* HTML_UI = R"rawliteral(
     document.getElementById('overlay').classList.toggle('open');
   }
 
-  function saveConfig(notify = true) {
+  function saveConfig() {
     const val = document.getElementById('sys_prompt').value;
     localStorage.setItem(CONFIG_KEY, val);
-    fetch('/api/config', {
-      method: 'POST',
-      body: JSON.stringify({ system_prompt: val })
-    });
-    if (notify) toggleDrawer();
+    fetch('/api/config', { method: 'POST', body: JSON.stringify({ system_prompt: val }) });
+    toggleDrawer();
   }
 
   function clearChat() {
     chatHistory = [];
-    saveStorage();
-    renderChat();
+    localStorage.removeItem(STORAGE_KEY);
+    renderFeed();
     toggleDrawer();
   }
 
-  // --- .AOS EXPORT & IMPORT ---
-  function exportChatSession() {
-    const data = {
-      format: "aos_chat_v1",
-      timestamp: Date.now(),
-      messages: chatHistory
-    };
-    downloadFile(JSON.stringify(data, null, 2), `session_${Date.now()}.aos`);
-  }
-
-  function triggerImport(type) {
-    if (type === 'aos') document.getElementById('file_import_aos').click();
-    if (type === 'aosb') document.getElementById('file_import_aosb').click();
-  }
-
-  function importChatFile(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const parsed = JSON.parse(evt.target.result);
-        if (parsed.messages && Array.isArray(parsed.messages)) {
-          chatHistory = parsed.messages;
-          saveStorage();
-          renderChat();
-          toggleDrawer();
-        }
-      } catch(err) { alert('Invalid .aos file!'); }
-    };
-    reader.readAsText(file);
-  }
-
-  // --- .AOSB BOT CONFIG EXPORT & IMPORT ---
-  function exportBotConfig() {
-    const cfg = {
-      format: "aos_bot_v1",
-      name: "AetherOS Preset",
-      system_prompt: document.getElementById('sys_prompt').value
-    };
-    downloadFile(JSON.stringify(cfg, null, 2), `preset_${Date.now()}.aosb`);
-  }
-
-  function importBotFile(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const parsed = JSON.parse(evt.target.result);
-        if (parsed.system_prompt) {
-          document.getElementById('sys_prompt').value = parsed.system_prompt;
-          saveConfig(true);
-        }
-      } catch(err) { alert('Invalid .aosb file!'); }
-    };
-    reader.readAsText(file);
-  }
-
-  function downloadFile(content, filename) {
-    const blob = new Blob([content], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  // Populate models dropdown
   fetch('/api/models').then(r => r.json()).then(models => {
     const sel = document.getElementById('model_select');
     sel.innerHTML = '';
     models.forEach(m => {
       const opt = document.createElement('option');
       opt.value = m;
-      opt.innerText = m.replace('model/', '');
+      opt.innerText = m.split('/').pop();
       sel.appendChild(opt);
     });
   });
@@ -453,30 +390,60 @@ const char* HTML_UI = R"rawliteral(
     fetch('/api/set_model', { method: 'POST', body: m });
   }
 
-  // --- Streaming Generation ---
-  let activeBotMessage = null;
   function sendPrompt() {
-    const input = document.getElementById('prompt');
+    const input = document.getElementById('prompt-in');
     const text = input.value.trim();
     if (!text) return;
     input.value = '';
 
     chatHistory.push({ role: 'User', text: text });
-    chatHistory.push({ role: 'AOS', text: '' });
-    saveStorage();
-    renderChat();
+    renderFeed();
 
-    document.getElementById('status').innerText = 'Generating...';
+    // Live Animated Thinking Buffer
+    const feed = document.getElementById('chat-feed');
+    const thinkId = 'think-' + Date.now();
+    let startTime = Date.now();
+    feed.innerHTML += `
+      <div class="entry" id="${thinkId}">
+        <span class="tag bot">AETHER-OS</span>
+        <div><span class="thinking-indicator">⠋ Thinking (<span class="sec">0.0</span>s)...</span></div>
+      </div>`;
+    feed.scrollTop = feed.scrollHeight;
 
+    thinkingTimer = setInterval(() => {
+      const el = document.getElementById(thinkId);
+      if (el) {
+        const sec = ((Date.now() - startTime) / 1000).toFixed(1);
+        el.querySelector('.sec').innerText = sec;
+      }
+    }, 100);
+
+    setGenerating(true);
+
+    let firstToken = true;
     const evt = new EventSource(`/api/chat?prompt=${encodeURIComponent(text)}`);
+
     evt.onmessage = (e) => {
+      if (firstToken) {
+        firstToken = false;
+        clearInterval(thinkingTimer);
+        const thinkEl = document.getElementById(thinkId);
+        if (thinkEl) thinkEl.remove();
+
+        chatHistory.push({ role: 'AOS', text: '' });
+      }
       chatHistory[chatHistory.length - 1].text += e.data;
-      renderChat();
+      renderFeed();
     };
+
     evt.onerror = () => {
       evt.close();
-      saveStorage();
-      document.getElementById('status').innerText = 'Ready';
+      clearInterval(thinkingTimer);
+      const thinkEl = document.getElementById(thinkId);
+      if (thinkEl && firstToken) thinkEl.remove();
+
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(chatHistory));
+      setGenerating(false);
     };
   }
 
@@ -484,7 +451,26 @@ const char* HTML_UI = R"rawliteral(
     fetch('/api/stop', { method: 'POST' });
   }
 
-  window.addEventListener('DOMContentLoaded', loadStorage);
+  function setGenerating(isGen) {
+    document.getElementById('send-btn').style.display = isGen ? 'none' : 'flex';
+    document.getElementById('stop-btn').style.display = isGen ? 'flex' : 'none';
+    document.getElementById('status-pill').innerText = isGen ? 'Generating...' : 'Ready';
+    document.getElementById('status-pill').style.color = isGen ? '#D97706' : '#71717a';
+  }
+
+  document.getElementById('prompt-in').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendPrompt();
+  });
+
+  window.addEventListener('DOMContentLoaded', () => {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      try { chatHistory = JSON.parse(raw); } catch(e) {}
+    }
+    renderFeed();
+    const sys = localStorage.getItem(CONFIG_KEY);
+    if (sys) document.getElementById('sys_prompt').value = sys;
+  });
 </script>
 </body>
 </html>
@@ -590,8 +576,8 @@ int main() {
     });
 
     std::cout << "\n============================================\n";
-    std::cout << "  AETHER-OS PERSISTENT SERVER ACTIVE\n";
-    std::cout << "  Open: http://localhost:8080\n";
+    std::cout << "  AETHER-OS SERVER ACTIVE\n";
+    std::cout << "  URL: http://localhost:8080\n";
     std::cout << "============================================\n";
 
     svr.listen("0.0.0.0", 8080);

@@ -20,3 +20,4 @@ default.aosb
 imgui.ini
 *.log
 llama.exe
+chats/*
