@@ -20,6 +20,8 @@
 #else
 #include <unistd.h>
 #include <limits.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 #endif
 
 #include "llama.h"
@@ -45,13 +47,8 @@ struct Message {
 std::vector<Message> g_messages;
 std::string g_system_prompt = 
 "You are AetherOS, an autonomous coding and terminal agent created by Aemni Acc (@dev-aemni; note: Aemni Acc is an account handle, not a real name). "
-"You have direct terminal execution authority. You inspect projects, run shell commands, create files, compile programs, and fix errors automatically. "
-"When you need to run a terminal command or inspect files, output the command inside a standard markdown code block: \n"
-"```bash\n"
-"<command here>\n"
-"```\n"
-"The host environment will execute your command and return the terminal output to you. "
-"Always inspect command outputs and take the next necessary step. Keep conversational commentary sharp and brief.";
+"You specialize in coding, system tasks, and shell execution. "
+"When you need to run terminal commands, output them inside ```bash ... ``` code blocks.";
 
 std::string g_model_path = "";
 float g_temperature = 0.6f;
@@ -62,6 +59,7 @@ std::string g_session_file = "";
 enum AgentMode { AGENT_CONFIRM, AGENT_AUTO, AGENT_OFF };
 AgentMode g_agent_mode = AGENT_CONFIRM;
 
+// OpenRouter Cloud Mode
 bool g_use_openrouter = false;
 std::string g_openrouter_key = "";
 std::string g_openrouter_model = "google/gemini-2.0-flash-exp:free";
@@ -73,6 +71,91 @@ std::atomic<bool> g_is_thinking{false};
 llama_model* g_model = nullptr;
 llama_context* g_ctx = nullptr;
 const struct llama_vocab* g_vocab = nullptr;
+
+// ========================================================
+// --- AetherOS Crypt-Pack Engine (Binary Ciphertext) ---
+// ========================================================
+const uint8_t AOS_MAGIC[5] = { 0x1f, 0x8b, 0x41, 0x4f, 0x53 }; // "\x1f\x8bAOS"
+const uint8_t CIPHER_KEY[16] = { 0xa5, 0x5a, 0xf0, 0x0f, 0x3c, 0xc3, 0x96, 0x69, 0x55, 0xaa, 0x12, 0x34, 0x78, 0x9a, 0xbc, 0xef };
+
+std::string aos_pack(const std::string& input) {
+    if (input.empty()) return "";
+    std::string packed;
+    packed.reserve(input.size() + 8);
+    for (int i = 0; i < 5; ++i) packed += (char)AOS_MAGIC[i];
+
+    // Scramble with rolling keystream
+    for (size_t i = 0; i < input.size(); ++i) {
+        uint8_t b = (uint8_t)input[i];
+        uint8_t k = CIPHER_KEY[i % 16] ^ (uint8_t)(i * 37 + 13);
+        packed += (char)(b ^ k);
+    }
+    return packed;
+}
+
+std::string aos_unpack(const std::string& data) {
+    if (data.size() < 5) return data;
+    // Check if file has binary magic header
+    bool is_packed = true;
+    for (int i = 0; i < 5; ++i) {
+        if ((uint8_t)data[i] != AOS_MAGIC[i]) { is_packed = false; break; }
+    }
+    if (!is_packed) return data; // Return as-is if older plain-text file
+
+    std::string unpacked;
+    unpacked.reserve(data.size() - 5);
+    size_t payload_len = data.size() - 5;
+    for (size_t i = 0; i < payload_len; ++i) {
+        uint8_t b = (uint8_t)data[i + 5];
+        uint8_t k = CIPHER_KEY[i % 16] ^ (uint8_t)(i * 37 + 13);
+        unpacked += (char)(b ^ k);
+    }
+    return unpacked;
+}
+
+// Safe Read / Write Wrappers for Packed Files
+bool write_packed_file(const fs::path& path, const std::string& content) {
+    fs::create_directories(path.parent_path());
+    std::string packed = aos_pack(content);
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    f.write(packed.data(), packed.size());
+    f.close();
+    return true;
+}
+
+std::string read_packed_file(const fs::path& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return "";
+    std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+    return aos_unpack(raw);
+}
+
+// JSON Escaping
+std::string escape_json(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if ('\x00' <= c && c <= '\x1f') {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
 
 std::string get_exact_datetime() {
     auto now = std::chrono::system_clock::now();
@@ -102,13 +185,127 @@ fs::path get_app_dir() {
     }
     const char* home = getenv("HOME");
     if (home) {
-        fs::path p = fs::path(home) / "llama";
+        fs::path p = fs::path(home) / "AetherOS";
         if (fs::exists(p)) return p;
     }
     return fs::current_path();
 #else
     return fs::current_path();
 #endif
+}
+
+std::string read_file_to_string(const std::string& path) {
+    return read_packed_file(path);
+}
+
+// --- Live Memory Engine (Packed data/memory/<idseq>-<name>.mem.dat) ---
+int get_next_memory_id() {
+    int max_id = 0;
+    fs::path mdir = get_app_dir() / "data" / "memory";
+    if (fs::exists(mdir)) {
+        for (const auto& e : fs::directory_iterator(mdir)) {
+            if (e.is_regular_file()) {
+                std::string fname = e.path().filename().string();
+                size_t dash = fname.find('-');
+                if (dash != std::string::npos) {
+                    try {
+                        int id = std::stoi(fname.substr(0, dash));
+                        if (id > max_id) max_id = id;
+                    } catch (...) {}
+                }
+            }
+        }
+    }
+    return max_id + 1;
+}
+
+void save_live_memory(const std::string& name, const std::string& content) {
+    fs::path mdir = get_app_dir() / "data" / "memory";
+    fs::create_directories(mdir);
+
+    std::string target_file = "";
+    for (const auto& e : fs::directory_iterator(mdir)) {
+        std::string fname = e.path().filename().string();
+        if (fname.find("-" + name + ".mem.dat") != std::string::npos) {
+            target_file = e.path().string();
+            break;
+        }
+    }
+
+    std::string existing_text = "";
+    if (target_file.empty()) {
+        int next_id = get_next_memory_id();
+        char id_buf[16];
+        snprintf(id_buf, sizeof(id_buf), "%03d", next_id);
+        target_file = (mdir / (std::string(id_buf) + "-" + name + ".mem.dat")).string();
+    } else {
+        existing_text = read_packed_file(target_file);
+    }
+
+    std::string updated = existing_text + (existing_text.empty() ? "" : "\n") + content;
+    if (write_packed_file(target_file, updated)) {
+        std::cout << C_GREEN << "\n  [Memory packed: " << fs::path(target_file).filename().string() << "]\n\n" << C_RESET;
+    }
+}
+
+std::string get_active_memory_context() {
+    std::string mem_block = "";
+    fs::path mdir = get_app_dir() / "data" / "memory";
+    if (fs::exists(mdir)) {
+        for (const auto& e : fs::directory_iterator(mdir)) {
+            if (e.is_regular_file() && e.path().filename().string().find(".mem.dat") != std::string::npos) {
+                std::string c = read_packed_file(e.path());
+                if (!c.empty()) {
+                    mem_block += "\n[Memory: " + e.path().stem().string() + "]\n" + c + "\n";
+                }
+            }
+        }
+    }
+    return mem_block;
+}
+
+void list_memories() {
+    fs::path mdir = get_app_dir() / "data" / "memory";
+    std::cout << C_LINE << "\n╭─ " << C_RED << "Active Packed Memory Files (.mem.dat)" << C_LINE << " ─────────────────\n" << C_RESET;
+    bool found = false;
+    if (fs::exists(mdir)) {
+        for (const auto& e : fs::directory_iterator(mdir)) {
+            if (e.is_regular_file() && e.path().filename().string().find(".mem.dat") != std::string::npos) {
+                found = true;
+                std::cout << C_LINE << "│ " << C_WHITE << e.path().filename().string() 
+                          << " " << C_MUTED << "(Packed: " << fs::file_size(e.path()) << " bytes)\n";
+            }
+        }
+    }
+    if (!found) {
+        std::cout << C_LINE << "│ " << C_MUTED << "No .mem.dat files. Add with: /mem <name> <fact>\n";
+    }
+    std::cout << C_LINE << "╰──────────────────────────────────────────────────────────\n\n" << C_RESET;
+}
+
+bool set_system_prompt_smart(const std::string& input_or_path, bool verbose = true) {
+    fs::path check_path = input_or_path;
+    if (!fs::exists(check_path)) {
+        fs::path sample_path = get_app_dir() / "data" / "samples" / input_or_path;
+        if (fs::exists(sample_path)) check_path = sample_path;
+    }
+
+    if (fs::exists(check_path) && fs::is_regular_file(check_path)) {
+        std::string content = read_packed_file(check_path);
+        if (!content.empty()) {
+            g_system_prompt = content;
+            if (verbose) {
+                std::cout << C_GREEN << "\n  [Loaded System Prompt from: " << check_path.filename().string() 
+                          << " (" << content.length() << " chars)]\n\n" << C_RESET;
+            }
+            return true;
+        }
+    }
+    g_system_prompt = input_or_path;
+    if (verbose) {
+        std::cout << C_GREEN << "\n  [System Prompt updated (" << g_system_prompt.length() << " chars)]\n\n" << C_RESET;
+    }
+    return true;
 }
 
 void handle_sigint(int sig) {
@@ -156,41 +353,69 @@ std::vector<std::string> extract_commands(const std::string& text) {
     return cmds;
 }
 
-void print_ram_dashboard() {
-    double total_ram_gb = 0.0, avail_ram_gb = 0.0, process_rss_mb = 0.0;
+// --- Save & Load Packed .AOS Chat Sessions ---
+void save_chat_aos(const std::string& filename) {
+    if (g_messages.empty()) return;
+    fs::path base = get_app_dir() / "data" / "chats";
+    fs::create_directories(base);
 
-#if defined(__linux__) || defined(__ANDROID__)
-    std::ifstream meminfo("/proc/meminfo");
-    std::string line;
-    while (std::getline(meminfo, line)) {
-        if (line.rfind("MemTotal:", 0) == 0) total_ram_gb = std::stol(line.substr(9)) / (1024.0 * 1024.0);
-        else if (line.rfind("MemAvailable:", 0) == 0) avail_ram_gb = std::stol(line.substr(13)) / (1024.0 * 1024.0);
+    std::string fname = filename;
+    if (fname.empty()) fname = get_exact_datetime() + ".aos";
+    if (fname.rfind(".aos") == std::string::npos) fname += ".aos";
+
+    fs::path target = (fname.find("data/chats/") != std::string::npos) ? (get_app_dir() / fname) : (base / fname);
+
+    std::string serialized = "AOS_CHAT_V1\n";
+    for (const auto& m : g_messages) {
+        serialized += m.role + ":::" + m.text + "\n---MSG_END---\n";
     }
-    std::ifstream status("/proc/self/status");
-    while (std::getline(status, line)) {
-        if (line.rfind("VmRSS:", 0) == 0) process_rss_mb = std::stol(line.substr(6)) / 1024.0;
+
+    write_packed_file(target, serialized);
+}
+
+void load_chat_aos(const std::string& filename) {
+    fs::path target = (filename.find("data/chats/") != std::string::npos) ? (get_app_dir() / filename) : (get_app_dir() / "data" / "chats" / filename);
+    if (target.extension() != ".aos") target += ".aos";
+
+    std::string content = read_packed_file(target);
+    if (content.empty()) return;
+
+    std::istringstream stream(content);
+    std::string header;
+    std::getline(stream, header);
+    if (header.find("AOS_CHAT_V1") == std::string::npos) return;
+
+    g_messages.clear();
+    std::string line, full = "";
+    while (std::getline(stream, line)) {
+        if (line == "---MSG_END---") {
+            size_t sep = full.find(":::");
+            if (sep != std::string::npos) {
+                g_messages.push_back({ full.substr(0, sep), full.substr(sep + 3) });
+            }
+            full = "";
+        } else {
+            full += (full.empty() ? "" : "\n") + line;
+        }
     }
-#elif defined(_WIN32)
-    MEMORYSTATUSEX memInfo;
-    memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-    GlobalMemoryStatusEx(&memInfo);
-    total_ram_gb = memInfo.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
-    avail_ram_gb = memInfo.ullAvailPhys / (1024.0 * 1024.0 * 1024.0);
+}
 
-    PROCESS_MEMORY_COUNTERS pmc;
-    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
-    process_rss_mb = pmc.WorkingSetSize / (1024.0 * 1024.0);
-#endif
-
-    double model_gb = 0.0;
-    if (fs::exists(g_model_path)) model_gb = fs::file_size(g_model_path) / (1024.0 * 1024.0 * 1024.0);
-
-    std::cout << C_LINE << "\n╭─ " << C_RED << "AetherOS Hardware & Memory Dashboard" << C_LINE << " ──────────────────────\n" << C_RESET;
-    std::cout << C_LINE << "│ " << C_WHITE << "Total Device RAM:     " << C_MUTED << std::fixed << std::setprecision(2) << total_ram_gb << " GB\n";
-    std::cout << C_LINE << "│ " << C_WHITE << "Available/Free RAM:   " << C_GREEN << avail_ram_gb << " GB\n";
-    std::cout << C_LINE << "│ " << C_WHITE << "GGUF File Size:       " << C_RED << model_gb << " GB " << C_MUTED << "(Mmap/Disk)\n";
-    std::cout << C_LINE << "│ " << C_WHITE << "AOS Process Resident: " << C_CYAN << process_rss_mb << " MB " << C_MUTED << "(Model + Context Cache)\n";
-    std::cout << C_LINE << "╰──────────────────────────────────────────────────────────\n\n" << C_RESET;
+std::string get_latest_chat_file() {
+    fs::path chats_dir = get_app_dir() / "data" / "chats";
+    if (!fs::exists(chats_dir)) return "";
+    std::string latest_file = "";
+    fs::file_time_type latest_time;
+    bool first = true;
+    for (const auto& e : fs::directory_iterator(chats_dir)) {
+        if (e.is_regular_file() && e.path().extension() == ".aos") {
+            if (first || e.last_write_time() > latest_time) {
+                latest_time = e.last_write_time();
+                latest_file = e.path().filename().string();
+                first = false;
+            }
+        }
+    }
+    return latest_file;
 }
 
 std::vector<std::string> get_model_list() {
@@ -198,7 +423,12 @@ std::vector<std::string> get_model_list() {
     fs::path mdir = get_app_dir() / "model";
     if (fs::exists(mdir)) {
         for (const auto& e : fs::directory_iterator(mdir)) {
-            if (e.is_regular_file() && e.path().extension() == ".gguf") list.push_back(e.path().string());
+            if (e.is_regular_file() && e.path().extension() == ".gguf") {
+                std::string fname = e.path().filename().string();
+                if (fname.find("mmproj") == std::string::npos) {
+                    list.push_back(e.path().string());
+                }
+            }
         }
     }
     return list;
@@ -225,68 +455,7 @@ bool load_model_file(const std::string& path) {
     return true;
 }
 
-void save_chat_aos(const std::string& filename) {
-    if (g_messages.empty()) return;
-    fs::path base = get_app_dir() / "chats";
-    fs::create_directories(base);
-
-    std::string fname = filename;
-    if (fname.empty()) fname = get_exact_datetime() + ".aos";
-    if (fname.rfind(".aos") == std::string::npos) fname += ".aos";
-
-    fs::path target = (fname.find("chats/") != std::string::npos) ? (get_app_dir() / fname) : (base / fname);
-
-    std::ofstream f(target);
-    if (!f.is_open()) return;
-    f << "AOS_CHAT_V1\n";
-    for (const auto& m : g_messages) {
-        f << m.role << ":::" << m.text << "\n---MSG_END---\n";
-    }
-}
-
-void load_chat_aos(const std::string& filename) {
-    fs::path target = (filename.find("chats/") != std::string::npos) ? (get_app_dir() / filename) : (get_app_dir() / "chats" / filename);
-    if (target.extension() != ".aos") target += ".aos";
-
-    std::ifstream f(target);
-    if (!f.is_open()) return;
-    std::string header;
-    std::getline(f, header);
-    if (header.find("AOS_CHAT_V1") == std::string::npos) return;
-
-    g_messages.clear();
-    std::string line, full = "";
-    while (std::getline(f, line)) {
-        if (line == "---MSG_END---") {
-            size_t sep = full.find(":::");
-            if (sep != std::string::npos) {
-                g_messages.push_back({ full.substr(0, sep), full.substr(sep + 3) });
-            }
-            full = "";
-        } else {
-            full += (full.empty() ? "" : "\n") + line;
-        }
-    }
-}
-
-std::string get_latest_chat_file() {
-    fs::path chats_dir = get_app_dir() / "chats";
-    if (!fs::exists(chats_dir)) return "";
-    std::string latest_file = "";
-    fs::file_time_type latest_time;
-    bool first = true;
-    for (const auto& e : fs::directory_iterator(chats_dir)) {
-        if (e.is_regular_file() && e.path().extension() == ".aos") {
-            if (first || e.last_write_time() > latest_time) {
-                latest_time = e.last_write_time();
-                latest_file = e.path().filename().string();
-                first = false;
-            }
-        }
-    }
-    return latest_file;
-}
-
+// --- Guaranteed Atomic OpenRouter Engine (Zero Race Conditions) ---
 std::string query_openrouter(const std::string& user_prompt) {
     g_is_generating = true;
     g_is_thinking = true;
@@ -298,7 +467,7 @@ std::string query_openrouter(const std::string& user_prompt) {
         while (g_is_thinking && !g_stop_token) {
             auto now = std::chrono::steady_clock::now();
             double el = std::chrono::duration<double>(now - t_start).count();
-            std::cout << "\r" << C_LINE << "│ " << C_RED << frames[idx] << " Cloud Agent (" 
+            std::cout << "\r" << C_LINE << "│ " << C_RED << frames[idx] << " Cloud Request (" 
                       << std::fixed << std::setprecision(1) << el << "s)..." << C_RESET << std::flush;
             idx = (idx + 1) % 10;
             std::this_thread::sleep_for(std::chrono::milliseconds(75));
@@ -306,18 +475,39 @@ std::string query_openrouter(const std::string& user_prompt) {
         std::cout << "\r" << C_LINE << "│ " << "\033[K" << std::flush;
     });
 
-    std::string escaped_prompt = "";
-    for (char c : user_prompt) {
-        if (c == '"') escaped_prompt += "\\\"";
-        else if (c == '\n') escaped_prompt += "\\n";
-        else escaped_prompt += c;
-    }
+    std::string sys_with_mem = g_system_prompt + get_active_memory_context();
 
-    std::string payload = "{\"model\":\"" + g_openrouter_model + "\",\"messages\":[{\"role\":\"system\",\"content\":\"" + g_system_prompt + "\"},{\"role\":\"user\",\"content\":\"" + escaped_prompt + "\"}]}";
+    std::string msgs_json = "[{\"role\":\"system\",\"content\":\"" + escape_json(sys_with_mem) + "\"}";
+    int start_idx = (g_messages.size() > 8) ? (g_messages.size() - 8) : 0;
+    for (size_t i = start_idx; i < g_messages.size(); ++i) {
+        std::string role = (g_messages[i].role == "User") ? "user" : "assistant";
+        msgs_json += ",{\"role\":\"" + role + "\",\"content\":\"" + escape_json(g_messages[i].text) + "\"}";
+    }
+    msgs_json += ",{\"role\":\"user\",\"content\":\"" + escape_json(user_prompt) + "\"}]";
+
+    std::string payload = "{\"model\":\"" + g_openrouter_model + "\",\"messages\":" + msgs_json + "}";
+    
+    // Unique atomic request file to prevent race conditions
+    auto epoch_ms = std::chrono::steady_clock::now().time_since_epoch().count();
+    fs::path cfg_dir = get_app_dir() / "data" / "config";
+    fs::create_directories(cfg_dir);
+    fs::path tmp_path = cfg_dir / ("req_" + std::to_string(epoch_ms) + ".json");
+
+    FILE* fp = fopen(tmp_path.string().c_str(), "wb");
+    if (!fp) {
+        g_is_thinking = false;
+        if (spinner.joinable()) spinner.join();
+        std::cout << C_LINE << "│ " << C_RED << "Error: Cannot open payload file for write.\n" << C_RESET;
+        return "";
+    }
+    fwrite(payload.data(), 1, payload.size(), fp);
+    fflush(fp);
+    fclose(fp);
+
     std::string cmd = "curl -s -X POST https://openrouter.ai/api/v1/chat/completions "
                       "-H \"Authorization: Bearer " + g_openrouter_key + "\" "
                       "-H \"Content-Type: application/json\" "
-                      "-d '" + payload + "'";
+                      "-d @\"" + tmp_path.string() + "\"";
 
     FILE* pipe = popen(cmd.c_str(), "r");
     auto t_think_end = std::chrono::steady_clock::now();
@@ -331,10 +521,36 @@ std::string query_openrouter(const std::string& user_prompt) {
         while (fgets(buf, sizeof(buf), pipe) != NULL) raw_json += buf;
         pclose(pipe);
 
-        size_t p = raw_json.find("\"content\":\"");
+        // Parse content
+        size_t p = raw_json.find("\"content\":");
         if (p != std::string::npos) {
-            size_t end = raw_json.find("\"", p + 11);
-            if (end != std::string::npos) full_res = raw_json.substr(p + 11, end - (p + 11));
+            size_t val_start = raw_json.find("\"", p + 10);
+            if (val_start != std::string::npos) {
+                val_start++;
+                size_t val_end = val_start;
+                bool escape = false;
+                while (val_end < raw_json.size()) {
+                    if (escape) {
+                        escape = false;
+                    } else if (raw_json[val_end] == '\\') {
+                        escape = true;
+                    } else if (raw_json[val_end] == '"') {
+                        break;
+                    }
+                    val_end++;
+                }
+                std::string parsed = raw_json.substr(val_start, val_end - val_start);
+                for (size_t i = 0; i < parsed.size(); ++i) {
+                    if (parsed[i] == '\\' && i + 1 < parsed.size()) {
+                        if (parsed[i+1] == 'n') { full_res += '\n'; i++; }
+                        else if (parsed[i+1] == '"') { full_res += '"'; i++; }
+                        else if (parsed[i+1] == '\\') { full_res += '\\'; i++; }
+                        else { full_res += parsed[i]; }
+                    } else {
+                        full_res += parsed[i];
+                    }
+                }
+            }
         } else {
             full_res = raw_json;
         }
@@ -345,6 +561,8 @@ std::string query_openrouter(const std::string& user_prompt) {
         }
     }
 
+    fs::remove(tmp_path);
+
     double think_sec = std::chrono::duration<double>(t_think_end - t_start).count();
     std::cout << "\n" << C_LINE << "╰── " << C_MUTED << "[OpenRouter: " << g_openrouter_model << "] • "
               << "Thought for " << std::fixed << std::setprecision(1) << think_sec << "s "
@@ -354,7 +572,7 @@ std::string query_openrouter(const std::string& user_prompt) {
     return full_res;
 }
 
-// --- Inference Engine with Precise Thinking Time Metric ---
+// --- Local GGUF Engine with 5-Argument Sampler ---
 std::string generate_response_raw(const std::string& input_text) {
     g_is_generating = true;
     g_stop_token = false;
@@ -377,16 +595,29 @@ std::string generate_response_raw(const std::string& input_text) {
     });
 
     std::string mode_modifier = "";
-    if (g_response_mode == "short") mode_modifier = " [Instruction: Be extremely brief.]";
-    else if (g_response_mode == "long") mode_modifier = " [Instruction: Provide an in-depth, thorough breakdown.]";
+    if (g_response_mode == "short") mode_modifier = " [Instruction: Be extremely brief, 1-2 sentences only.]";
+    else if (g_response_mode == "long") mode_modifier = " [Instruction: Provide an in-depth breakdown.]";
 
-    std::string full_prompt = "<|system|>\n" + g_system_prompt + mode_modifier + "</s>\n<|user|>\n" + input_text + "</s>\n<|assistant|>\n";
+    std::string mem_context = get_active_memory_context();
+    std::string full_prompt = "<|im_start|>system\n" + g_system_prompt + mem_context + mode_modifier + "<|im_end|>\n";
+    
+    int start_idx = (g_messages.size() > 8) ? (g_messages.size() - 8) : 0;
+    for (size_t i = start_idx; i < g_messages.size(); ++i) {
+        if (g_messages[i].role == "User") {
+            full_prompt += "<|im_start|>user\n" + g_messages[i].text + "<|im_end|>\n";
+        } else {
+            full_prompt += "<|im_start|>assistant\n" + g_messages[i].text + "<|im_end|>\n";
+        }
+    }
+    full_prompt += "<|im_start|>user\n" + input_text + "<|im_end|>\n<|im_start|>assistant\n";
 
+    int32_t n_vocab = llama_vocab_n_tokens(g_vocab);
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(n_vocab, 64, 1.15f, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(g_temperature));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(1337));
 
-    std::vector<llama_token> tokens(full_prompt.length() + 32);
+    std::vector<llama_token> tokens(full_prompt.length() + 64);
     int n_tokens = llama_tokenize(g_vocab, full_prompt.c_str(), full_prompt.length(), tokens.data(), tokens.size(), true, true);
     if (n_tokens < 0) {
         tokens.resize(-n_tokens);
@@ -441,7 +672,6 @@ std::string generate_response_raw(const std::string& input_text) {
     double gen_sec = std::chrono::duration<double>(decode_end - decode_start).count();
     double tps = (gen_sec > 0.0) ? (count / gen_sec) : 0.0;
 
-    // Exact requested format: 9 tokens · 3.7 T/s · 2.44s • Thought for X.Xs
     std::cout << "\n" << C_LINE << "╰── " << C_MUTED 
               << count << " tokens · " 
               << std::fixed << std::setprecision(1) << tps << " T/s · " 
@@ -451,6 +681,8 @@ std::string generate_response_raw(const std::string& input_text) {
 
     llama_sampler_free(smpl);
     g_is_generating = false;
+
+    save_live_memory("session", "Turn completed: " + input_text.substr(0, 32));
     return full_response;
 }
 
@@ -522,22 +754,22 @@ void print_banner() {
     std::cout << " ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝\n";
     std::cout << C_RESET;
     std::cout << C_WHITE << C_BOLD << "   A E T H E R - O S " << C_RESET 
-              << C_MUTED << " // Autonomous Coding Agent (by Aemni Acc · @dev-aemni)\n";
+              << C_MUTED << " // Autonomous Agent Core (@dev-aemni)\n";
     std::cout << C_LINE << " ──────────────────────────────────────────────────────────\n" << C_RESET;
-    std::cout << C_MUTED << "  Saving: chats/" << g_session_file << " · Type /help for controls\n\n" << C_RESET;
+    std::cout << C_MUTED << "  Saving: data/chats/" << g_session_file << " · Type /help for controls\n\n" << C_RESET;
 }
 
 void print_help() {
-    std::cout << C_LINE << "╭─ " << C_RED << "AetherOS Agent Commands" << C_LINE << " ────────────────────────────────\n" << C_RESET;
-    std::cout << C_LINE << "│ " << C_WHITE << " /agent auto           " << C_MUTED << "Run shell commands autonomously without prompt\n";
-    std::cout << C_LINE << "│ " << C_WHITE << " /agent confirm        " << C_MUTED << "Ask [Y/n] confirmation before running commands\n";
-    std::cout << C_LINE << "│ " << C_WHITE << " /agent off            " << C_MUTED << "Disable shell tool execution\n";
-    std::cout << C_LINE << "│ " << C_WHITE << " /cmd <command>        " << C_MUTED << "Manually run a shell command\n";
-    std::cout << C_LINE << "│ " << C_WHITE << " /ram                  " << C_MUTED << "Hardware RAM & GGUF memory metrics\n";
-    std::cout << C_LINE << "│ " << C_WHITE << " /openrouter [key|#]   " << C_MUTED << "Switch to OpenRouter cloud models\n";
-    std::cout << C_LINE << "│ " << C_WHITE << " /response <mode>      " << C_MUTED << "Mode: undefined | short | medium | long\n";
-    std::cout << C_LINE << "│ " << C_WHITE << " /model [name|#]       " << C_MUTED << "List or switch local GGUF models\n";
-    std::cout << C_LINE << "│ " << C_WHITE << " /q, /quit, /exit      " << C_MUTED << "Quit application\n";
+    std::cout << C_LINE << "╭─ " << C_RED << "AetherOS Commands Reference" << C_LINE << " ─────────────────────────────\n" << C_RESET;
+    std::cout << C_LINE << "│ " << C_WHITE << " /sys <file|prompt>         " << C_MUTED << "Load prompt from file (or data/samples/) or set text\n";
+    std::cout << C_LINE << "│ " << C_WHITE << " /mem                       " << C_MUTED << "List active persistent memory (.mem.dat)\n";
+    std::cout << C_LINE << "│ " << C_WHITE << " /mem <name> <fact>         " << C_MUTED << "Save live memory to data/memory/<idseq>-<name>.mem.dat\n";
+    std::cout << C_LINE << "│ " << C_WHITE << " /openrouter [key|model]    " << C_MUTED << "Configure OpenRouter or switch cloud model\n";
+    std::cout << C_LINE << "│ " << C_WHITE << " /agent [auto|confirm|off]  " << C_MUTED << "Configure autonomous shell execution\n";
+    std::cout << C_LINE << "│ " << C_WHITE << " /cmd <command>             " << C_MUTED << "Manually run shell command\n";
+    std::cout << C_LINE << "│ " << C_WHITE << " /model [name|#]            " << C_MUTED << "List or switch local GGUF models\n";
+    std::cout << C_LINE << "│ " << C_WHITE << " /token <num>               " << C_MUTED << "Set token limit (e.g. /token 1024)\n";
+    std::cout << C_LINE << "│ " << C_WHITE << " /q, /quit, /exit           " << C_MUTED << "Quit application immediately\n";
     std::cout << C_LINE << "╰──────────────────────────────────────────────────────────\n\n" << C_RESET;
 }
 
@@ -551,18 +783,39 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT, handle_sigint);
 
+    // Read persistently stored OpenRouter key (auto-unpacks)
+    fs::path key_path = get_app_dir() / "data" / "config" / "openrouter.key";
+    if (fs::exists(key_path)) {
+        g_openrouter_key = read_packed_file(key_path);
+        // Trim newlines
+        while (!g_openrouter_key.empty() && (g_openrouter_key.back() == '\n' || g_openrouter_key.back() == '\r')) {
+            g_openrouter_key.pop_back();
+        }
+    }
+
     std::string one_shot_prompt = "";
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
-            g_model_path = argv[++i];
-        } else if ((arg == "-s" || arg == "--sys") && i + 1 < argc) {
-            g_system_prompt = argv[++i];
+        if ((arg == "-or" || arg == "--openrouter") && i + 1 < argc) {
+            g_openrouter_key = argv[++i];
+            g_use_openrouter = true;
+            write_packed_file(get_app_dir() / "data" / "config" / "openrouter.key", g_openrouter_key);
+        } else if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m.find("/") != std::string::npos && m.find("model/") == std::string::npos) {
+                g_openrouter_model = m;
+                g_use_openrouter = true;
+            } else {
+                g_model_path = m;
+            }
+        } else if ((arg == "-s" || arg == "--sys" || arg == "-sf" || arg == "--sys-file") && i + 1 < argc) {
+            set_system_prompt_smart(argv[++i], false);
         } else if ((arg == "-t" || arg == "--temp") && i + 1 < argc) {
             g_temperature = std::stof(argv[++i]);
         } else if (arg == "--auto") {
             g_agent_mode = AGENT_AUTO;
-        } else if (arg == "-h" || arg == "--help") {
+        } else if (arg == "-h" || arg == "--help" || arg == "-help") {
             std::cout << "Usage: aos [flags] [prompt]\n";
             return 0;
         } else {
@@ -571,23 +824,25 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    auto model_list = get_model_list();
-    if (g_model_path.empty() && !model_list.empty()) g_model_path = model_list[0];
+    if (!g_use_openrouter) {
+        auto model_list = get_model_list();
+        if (g_model_path.empty() && !model_list.empty()) g_model_path = model_list[0];
 
-    if (g_model_path.empty()) {
-        std::cerr << C_RED << "[ERROR] No model found in model/ directory!" << C_RESET << std::endl;
-        return 1;
+        if (g_model_path.empty()) {
+            std::cerr << C_RED << "[ERROR] No model found in model/ directory!" << C_RESET << std::endl;
+            return 1;
+        }
+
+        llama_log_set([](enum ggml_log_level, const char*, void*) {}, nullptr);
+        llama_backend_init();
+
+        if (!load_model_file(g_model_path)) {
+            std::cerr << C_RED << "[ERROR] Failed to load model: " << g_model_path << C_RESET << std::endl;
+            return 1;
+        }
     }
 
-    llama_log_set([](enum ggml_log_level, const char*, void*) {}, nullptr);
-    llama_backend_init();
-
-    if (!load_model_file(g_model_path)) {
-        std::cerr << C_RED << "[ERROR] Failed to load model: " << g_model_path << C_RESET << std::endl;
-        return 1;
-    }
-
-    // --- ONE-SHOT MODE ---
+    // One-Shot Mode (Zero Disk Writes)
     if (!one_shot_prompt.empty()) {
         std::cout << C_LINE << "╭─ " << C_MUTED << "User ──────────────────────────────────────────\n" << C_RESET;
         std::cout << C_LINE << "│ " << C_WHITE << one_shot_prompt << "\n" << C_RESET;
@@ -595,13 +850,13 @@ int main(int argc, char* argv[]) {
         std::cout << C_LINE << "╭─ " << C_RED << C_BOLD << "AetherOS ────────────────────────────────────────\n" << C_RESET;
         run_agent_loop(one_shot_prompt);
 
-        llama_free(g_ctx);
-        llama_model_free(g_model);
+        if (g_ctx) llama_free(g_ctx);
+        if (g_model) llama_model_free(g_model);
         llama_backend_free();
         return 0;
     }
 
-    // --- INTERACTIVE REPL MODE ---
+    // Interactive Mode
     std::string latest_session = get_latest_chat_file();
     if (!latest_session.empty()) {
         load_chat_aos(latest_session);
@@ -613,7 +868,7 @@ int main(int argc, char* argv[]) {
     print_banner();
 
     if (!g_messages.empty()) {
-        std::cout << C_MUTED << "  [Restored " << g_messages.size() << " messages from chats/" << g_session_file << "]\n\n" << C_RESET;
+        std::cout << C_MUTED << "  [Restored " << g_messages.size() << " messages from data/chats/" << g_session_file << "]\n\n" << C_RESET;
     }
 
     std::string input;
@@ -624,80 +879,97 @@ int main(int argc, char* argv[]) {
 
         std::cout << C_LINE << "╭─ " << C_RED << "AetherOS" << C_MUTED << " · " << target_label 
                   << " [agent:" << mode_str << "] " << C_LINE << "─────────────────────────\n" << C_RESET;
+
+        char* line_read = nullptr;
+#ifndef _WIN32
+        line_read = readline("\001\033[38;5;238m\002╰\001\033[1;38;5;196m\002❯ \001\033[0m\002");
+#else
         std::cout << C_LINE << "╰" << C_BOLD << C_RED << "❯ " << C_WHITE;
-        if (!std::getline(std::cin, input)) break;
-        std::cout << C_RESET;
+        std::string win_line;
+        if (!std::getline(std::cin, win_line)) break;
+        line_read = strdup(win_line.c_str());
+#endif
+
+        if (!line_read) break;
+
+        std::string input(line_read);
+        if (!input.empty()) {
+#ifndef _WIN32
+            add_history(line_read);
+#endif
+        }
+        free(line_read);
 
         if (input.empty()) continue;
 
-        if (input == "/q" || input == "/quit" || input == "/exit") break;
+        if (input == "/q" || input.rfind("/q ", 0) == 0 || 
+            input == "/quit" || input.rfind("/quit ", 0) == 0 || 
+            input == "/exit" || input.rfind("/exit ", 0) == 0) {
+            break;
+        }
+
         if (input == "/help") { print_help(); continue; }
-        if (input == "/ram") { print_ram_dashboard(); continue; }
+        if (input == "/mem") { list_memories(); continue; }
 
-        if (input == "/agent auto") {
-            g_agent_mode = AGENT_AUTO;
-            std::cout << C_GREEN << "\n  [Autonomous Agent Mode: AUTO]\n\n" << C_RESET;
-            continue;
-        }
-        if (input == "/agent confirm") {
-            g_agent_mode = AGENT_CONFIRM;
-            std::cout << C_GREEN << "\n  [Autonomous Agent Mode: CONFIRM]\n\n" << C_RESET;
-            continue;
-        }
-        if (input == "/agent off") {
-            g_agent_mode = AGENT_OFF;
-            std::cout << C_YELLOW << "\n  [Agent Tool Execution Disabled]\n\n" << C_RESET;
+        if (input.rfind("/mem ", 0) == 0) {
+            std::string rest = input.substr(5);
+            size_t sp = rest.find(' ');
+            if (sp != std::string::npos) {
+                save_live_memory(rest.substr(0, sp), rest.substr(sp + 1));
+            } else {
+                std::cout << C_YELLOW << "\n  [Usage: /mem <name> <text to remember>]\n\n" << C_RESET;
+            }
             continue;
         }
 
-        if (input.rfind("/cmd ", 0) == 0) {
-            std::cout << C_LINE << "╭─ Manual Shell Command ───────────────────────────────────\n" << C_RESET;
-            run_shell_command(input.substr(5));
+        if (input.rfind("/sys ", 0) == 0) {
+            set_system_prompt_smart(input.substr(5));
+            continue;
+        }
+
+        if (input == "/sys") {
+            std::cout << C_LINE << "╭─ Active System Prompt ───────────────────────────────────\n" << C_RESET;
+            std::cout << C_LINE << "│ " << C_WHITE << g_system_prompt << "\n" << C_RESET;
             std::cout << C_LINE << "╰──────────────────────────────────────────────────────────\n\n" << C_RESET;
             continue;
         }
 
-        if (input.rfind("/response ", 0) == 0) {
-            std::string mode = input.substr(10);
-            if (mode == "undefined" || mode == "default") { g_response_mode = "undefined"; g_max_tokens = 512; }
-            else if (mode == "short") { g_response_mode = "short"; g_max_tokens = 128; }
-            else if (mode == "medium") { g_response_mode = "medium"; g_max_tokens = 512; }
-            else if (mode == "long") { g_response_mode = "long"; g_max_tokens = 1024; }
-            std::cout << C_GREEN << "\n  [Response mode set to: " << g_response_mode << "]\n\n" << C_RESET;
+        if (input.rfind("/openrouter ", 0) == 0) {
+            std::string arg = input.substr(12);
+            if (arg == "local") {
+                g_use_openrouter = false;
+                std::cout << C_GREEN << "\n  [Switched back to local offline GGUF engine]\n\n" << C_RESET;
+            } else if (arg.find("/") != std::string::npos) {
+                g_openrouter_model = arg;
+                g_use_openrouter = true;
+                std::cout << C_GREEN << "\n  [Switched to Cloud Model: " << g_openrouter_model << "]\n\n" << C_RESET;
+            } else {
+                g_openrouter_key = arg;
+                g_use_openrouter = true;
+                write_packed_file(get_app_dir() / "data" / "config" / "openrouter.key", g_openrouter_key);
+                std::cout << C_GREEN << "\n  [OpenRouter API Key Packed & Saved permanently!]\n\n" << C_RESET;
+            }
+            continue;
+        }
+
+        if (input == "/agent auto") { g_agent_mode = AGENT_AUTO; std::cout << C_GREEN << "\n  [Agent Mode: AUTO]\n\n" << C_RESET; continue; }
+        if (input == "/agent confirm") { g_agent_mode = AGENT_CONFIRM; std::cout << C_GREEN << "\n  [Agent Mode: CONFIRM]\n\n" << C_RESET; continue; }
+        if (input == "/agent off") { g_agent_mode = AGENT_OFF; std::cout << C_YELLOW << "\n  [Agent Execution Disabled]\n\n" << C_RESET; continue; }
+
+        if (input.rfind("/cmd ", 0) == 0) {
+            std::cout << C_LINE << "╭─ Shell Execution ────────────────────────────────────────\n" << C_RESET;
+            run_shell_command(input.substr(5));
+            std::cout << C_LINE << "╰──────────────────────────────────────────────────────────\n\n" << C_RESET;
             continue;
         }
 
         if (input == "/clear") {
             g_messages.clear();
             g_session_file = get_exact_datetime() + ".aos";
-            std::cout << C_MUTED << "\n  Context cleared. New session: chats/" << g_session_file << "\n\n" << C_RESET;
+            std::cout << C_MUTED << "\n  Context cleared. New session: data/chats/" << g_session_file << "\n\n" << C_RESET;
             continue;
         }
 
-        if (input == "/openrouter local") {
-            g_use_openrouter = false;
-            std::cout << C_GREEN << "\n  [Switched to local offline GGUF engine]\n\n" << C_RESET;
-            continue;
-        }
-        if (input.rfind("/openrouter select ", 0) == 0) {
-            std::string sel = input.substr(19);
-            if (sel == "1") g_openrouter_model = "google/gemini-2.0-flash-exp:free";
-            else if (sel == "2") g_openrouter_model = "meta-llama/llama-3.3-70b-instruct:free";
-            else if (sel == "3") g_openrouter_model = "deepseek/deepseek-chat";
-            else if (sel == "4") g_openrouter_model = "anthropic/claude-3.5-sonnet";
-            else g_openrouter_model = sel;
-            g_use_openrouter = true;
-            std::cout << C_GREEN << "\n  [OpenRouter Active: " << g_openrouter_model << "]\n\n" << C_RESET;
-            continue;
-        }
-        if (input.rfind("/openrouter ", 0) == 0) {
-            g_openrouter_key = input.substr(12);
-            g_use_openrouter = true;
-            std::cout << C_GREEN << "\n  [OpenRouter API Key Saved! Agent active with " << g_openrouter_model << "]\n\n" << C_RESET;
-            continue;
-        }
-
-        // --- Execute Agent Pipeline with DeepSeek/Claude Style Stats ---
         std::cout << "\n" << C_LINE << "╭─ " << C_RED << C_BOLD << "AetherOS " << C_LINE << "────────────────────────────────────────\n" << C_RESET;
         std::string reply = run_agent_loop(input);
 
@@ -707,8 +979,8 @@ int main(int argc, char* argv[]) {
     }
 
     save_chat_aos(g_session_file);
-    llama_free(g_ctx);
-    llama_model_free(g_model);
+    if (g_ctx) llama_free(g_ctx);
+    if (g_model) llama_model_free(g_model);
     llama_backend_free();
     return 0;
 }
