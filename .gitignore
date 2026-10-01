@@ -3,21 +3,30 @@ model/*.gguf
 *.gguf
 
 # Ignore local compiled Linux/Android binaries
-aos
-aos_imgui
+!aos
+!aos_imgui
 web_server
 generate
 test_*
 probe
 
 # Ignore portable Windows compiler (downloaded via script)
-w64devkit/
+w64devkit/*
 *.zip
 
 # Ignore temporary session autosaves & UI state
-autosave.aos
-default.aosb
-imgui.ini
+**.aos
+**.aosb
+*imgui*
+*.ini
 *.log
-llama.exe
-chats/*
+
+**.mem.dat
+
+data/chats/*
+data/config/*
+data/samples/*
+data/memory/*
+data/extra/*
+
+
