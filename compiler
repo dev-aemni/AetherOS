@@ -3,11 +3,12 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
 echo "=========================================="
-echo "  Compiling AetherOS CLI (src/cli.cpp)... "
+echo "  Compiling AetherOS (src/cli.cpp + src/ui.cpp)..."
 echo "=========================================="
 
-clang++ -std=c++17 -O3 src/cli.cpp \
+clang++ -std=c++17 -O3 src/cli.cpp src/ui.cpp \
   -Isrc/llama-runtime/include \
+  -Isrc \
   -Lsrc/llama-runtime/lib \
   -lllama -lggml -lggml-base -lggml-cpu \
   -lreadline \
@@ -21,7 +22,7 @@ if [ $? -eq 0 ]; then
   ln -sf "$DIR/aos" "$PREFIX/bin/aos"
   echo ""
   echo "[SUCCESS] AetherOS compiled successfully!"
-  echo "[+] Global command updated: Type 'aos' from anywhere."
+  echo "[+] Global command updated: Type 'aos' anywhere."
 else
   echo ""
   echo "[ERROR] Compilation failed!"
