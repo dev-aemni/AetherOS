@@ -22,11 +22,10 @@ w64devkit/*
 *.log
 
 **.mem.dat
+**.key
 
 data/chats/*
 data/config/*
 data/samples/*
 data/memory/*
 data/extra/*
-
-
